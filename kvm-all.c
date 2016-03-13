@@ -1469,7 +1469,11 @@ static int kvm_init(MachineState *ms)
     QTAILQ_INIT(&s->kvm_sw_breakpoints);
 #endif
     s->vmfd = -1;
-    s->fd = qemu_open("/dev/kvm", O_RDWR);
+    if (kvm2_enable) {
+        s->fd = qemu_open("/dev/kvm2", O_RDWR);
+    } else {
+        s->fd = qemu_open("/dev/kvm", O_RDWR);
+    }
     if (s->fd == -1) {
         fprintf(stderr, "Could not access KVM kernel module: %m\n");
         ret = -errno;

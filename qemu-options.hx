@@ -3047,6 +3047,9 @@ Enable KVM full virtualization support. This option is only available
 if KVM support is enabled when compiling.
 ETEXI
 
+DEF("kvm2", 0, QEMU_OPTION_kvm2_enable,
+    "-kvm2	using /dev/kvm2 for kvm module\n", QEMU_ARCH_ALL)
+
 DEF("xen-domid", HAS_ARG, QEMU_OPTION_xen_domid,
     "-xen-domid id   specify xen guest domain id\n", QEMU_ARCH_ALL)
 DEF("xen-create", 0, QEMU_OPTION_xen_create,

@@ -185,6 +185,7 @@ bool boot_strict;
 uint8_t *boot_splash_filedata;
 size_t boot_splash_filedata_size;
 uint8_t qemu_extra_params_fw[2];
+int kvm2_enable = 0;
 
 int icount_align_option;
 
@@ -4016,6 +4017,9 @@ int main(int argc, char **argv, char **envp)
                     error_report("open %s: %s", optarg, strerror(errno));
                     exit(1);
                 }
+                break;
+            case QEMU_OPTION_kvm2_enable:
+                kvm2_enable = 1;
                 break;
             default:
                 os_parse_cmd_args(popt->index, optarg);
