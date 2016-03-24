@@ -24,16 +24,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-//#define DEBUG_MIGRATION_EXEC
-
-#ifdef DEBUG_MIGRATION_EXEC
-#define DPRINTF(fmt, ...) \
-    do { printf("migration-exec: " fmt, ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTF(fmt, ...) \
-    do { } while (0)
-#endif
-
 void exec_start_outgoing_migration(MigrationState *s, const char *command, Error **errp)
 {
     s->file = qemu_popen_cmd(command, "w");

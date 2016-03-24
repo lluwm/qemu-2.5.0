@@ -1,4 +1,4 @@
-common-obj-y += migration.o tcp.o
+common-obj-y += migration.o tcp.o migration-slave.o migration-master.o
 common-obj-y += vmstate.o
 common-obj-y += qemu-file.o qemu-file-buf.o qemu-file-unix.o qemu-file-stdio.o
 common-obj-y += xbzrle.o postcopy-ram.o

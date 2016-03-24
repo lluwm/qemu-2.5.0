@@ -1,0 +1,443 @@
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include "qemu-common.h"
+#include "qemu/sockets.h"
+#include "qemu/rcu.h"
+#include "qemu/main-loop.h"
+#include "migration/migration.h"
+#include "migration/qemu-file.h"
+#include "migration/migr-task.h"
+#include "exec/cpu-common.h"
+
+#define MULTI_TRY 100
+
+#define RAM_SAVE_FLAG_COMPRESS 0x02
+#define RAM_SAVE_FLAG_PAGE     0x08
+#define RAM_SAVE_FLAG_CONTINUE 0x20
+
+#define MEM_VNUM_OFFSET        6
+
+//borrowed from savevm.c
+#define QEMU_VM_EOF                  0x00
+#define QEMU_VM_SECTION_START        0x01
+#define QEMU_VM_SECTION_PART         0x02
+#define QEMU_VM_SECTION_END          0x03
+#define QEMU_VM_SECTION_FULL         0x04
+#define QEMU_VM_SUBSECTION           0x05
+#define QEMU_VM_ITER_END             0x07
+//borrowed from block-migration.c
+#define BLK_MIG_FLAG_EOS                0x02
+
+//borrowed from arch_init.c
+#define RAM_SAVE_FLAG_EOS      0x10
+
+#define UNIX_PATH_MAX 108
+
+typedef QLIST_HEAD(migr_handler, LoadStateEntry) migr_handler;
+
+static int queue_pop_task(struct migration_task_queue *task_queue, void **arg);
+void * start_host_slave(void *data);
+void init_host_slaves(struct MigrationState *s);
+
+void slave_process_incoming_migration(QEMUFile *f, void *loadvm_handlers);
+void *start_dest_slave(void *data);
+
+const char *socket_paths[4]={"qmp-sock0", "qmp-sock1", "qmp-sock2", "qmp-sock3"};
+
+static void
+init_migr_barrier(struct migration_barrier *barr, int num_slaves) {
+    barr->mem_state = BARR_STATE_ITER_ERR;
+    //barrier for master and the main process
+    pthread_barrier_init(&barr->sender_iter_barr, NULL, num_slaves + 2);
+    pthread_barrier_init(&barr->next_iter_barr, NULL, num_slaves + 2);
+    pthread_mutex_init(&barr->master_lock, NULL);
+}
+
+const char *socket_path = "/home/jxiao/migration/clean/socket123";
+
+static void unix_wait_for_connect2(int fd, Error *err, void *opaque)
+{
+    MigrationState *s = opaque;
+
+    if (fd < 0) {
+        DPRINTF("migrate connect error: %s\n", error_get_pretty(err));
+        s->file = NULL;
+        migrate_fd_error(s);
+    } else {
+        DPRINTF("migrate connect success again\n");
+pthread_exit(NULL);
+        s->file = qemu_fopen_socket(fd, "wb");
+    }
+}
+
+void * start_host_slave(void *data) {
+    MigrationStateSlave *s = (MigrationStateSlave *)data;
+    struct task_body *body;
+    int fd;
+    int i;
+    QEMUFile *f;
+    struct timespec slave_sleep = {0, 1000000};
+    struct sockaddr_un addr;
+Error *local_err = NULL;
+
+unix_nonblocking_connect(socket_path, unix_wait_for_connect2, s, &local_err);
+sleep(200);
+pthread_exit(NULL);
+
+    DPRINTF("create connection %s\n", __FILE__);
+    if ( (fd = socket(AF_UNIX, SOCK_STREAM, 0)) > 0) {
+        DPRINTF("socket successful %s\n", __FILE__);
+    }else{
+        perror("socket error");
+        exit(-1);
+    }
+
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+//    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
+    snprintf(addr.sun_path, UNIX_PATH_MAX, "./socket123");
+
+    DPRINTF("connect %s %s\n", addr.sun_path, __FILE__);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
+        perror("connect error");
+sleep(100);
+pthread_exit(NULL);
+        exit(-1);
+    }
+
+    DPRINTF("connection successful %s %s\n", s->path, __FILE__);
+close(fd);
+sleep(100);
+pthread_exit(NULL);
+
+    s->file = qemu_fopen_socket(fd, "wb");
+    //s->file = qemu_fopen_ops(s, &unix_write_ops);
+    f = s->file;
+    //pthread_barrier_wait(&s->sender_barr->sender_iter_barr);
+
+    DPRINTF("slave start migration, file %p\n", f);
+    /*
+     * wait for following commands
+     * As disk task maybe limited by the disk throughput, so we perfer to transfer disk first and then memory
+     * While sending data in one iteration, we assume the total throughput of this iteration is static
+     * So the effect of sending memory first and sending disk first is same.
+     */
+    while (1) {
+        void *body_p;
+        /* check for memory */
+        if (queue_pop_task(s->mem_task_queue, &body_p) > 0) {
+            body = (struct task_body *)body_p;
+            //DPRINTF("get mem task, %lx: %p, %d, section id %d\n", body->pages[0].addr,
+            //       body->pages[0].ptr,
+            //       s->mem_task_queue->iter_num, s->mem_task_queue->section_id);
+            /* Section type */
+            qemu_put_byte(f, QEMU_VM_SECTION_PART);
+            qemu_put_be32(f, s->mem_task_queue->section_id);
+//pthread_exit(NULL);
+            for (i = 0; i < body->len; i++) {
+                s->mem_task_queue->slave_sent[s->id] += 1;
+//                    ram_save_block_slave(body->pages[i].addr, body->pages[i].ptr,
+//                                         body->pages[i].block, s, s->mem_task_queue->iter_num);
+            }
+
+            /* End of the single task */
+            qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
+            qemu_fflush(f);
+
+            free(body);
+        }
+        /* no disk and memory task */
+        else {
+            if (s->sender_barr->mem_state == BARR_STATE_ITER_END) {
+//                char buf[4];
+//                int rret;
+                DPRINTF("Iteration End fall into barriers\n");
+                qemu_put_byte(f, QEMU_VM_ITER_END);
+                qemu_fflush(f);
+//                rret = read(s->fd, buf, sizeof("OK"));
+                pthread_barrier_wait(&s->sender_barr->sender_iter_barr);
+                pthread_barrier_wait(&s->sender_barr->next_iter_barr);
+            }
+            else if (s->sender_barr->mem_state == BARR_STATE_ITER_TERMINATE) {
+                DPRINTF("Last Iteration End\n");
+                qemu_put_byte(f, QEMU_VM_EOF);
+                qemu_fflush(f);
+                pthread_barrier_wait(&s->sender_barr->sender_iter_barr);
+
+                break;
+            }
+
+            //get nothing, wait for a moment
+            nanosleep(&slave_sleep, NULL);
+        }
+    }
+
+    DPRINTF("slave terminate\n");
+    pthread_exit(NULL);
+}
+
+void init_host_slaves(struct MigrationState *s) {
+    int i;
+
+    DPRINTF("start init slaves %d %s\n", NUM_SLAVES, __FILE__);
+    s->sender_barr = (struct migration_barrier *)malloc(sizeof(struct migration_barrier));
+    init_migr_barrier(s->sender_barr, NUM_SLAVES);
+
+    MigrationStateSlave *slave_p = NULL;
+    for (i = 0; i < NUM_SLAVES; i ++) {
+        MigrationStateSlave *slave;
+        pthread_t tid;
+
+        slave = g_malloc0(sizeof(*slave));
+        slave->mem_task_queue = s->mem_task_queue;
+        slave->sender_barr = s->sender_barr;
+        slave->id = i;
+        slave->path = socket_paths[i];
+
+        DPRINTF("slave is %p, %s\n", slave, slave->path);
+        pthread_create(&tid, NULL, start_host_slave, slave);
+        slave->next = slave_p;
+        slave_p = slave;
+        DPRINTF("one slave thread is created\n");
+    }
+}
+
+struct dest_slave_para{
+    const char * path;
+    void *handlers;
+    pthread_barrier_t *end_barrier;
+};
+
+void *start_dest_slave(void *data) {
+
+    struct sockaddr_un addr;
+    int fd;
+    int c;
+    QEMUFile *f;
+    struct dest_slave_para * para = (struct dest_slave_para *)data;
+
+    DPRINTF("create connection %s\n", __FILE__);
+    if ( (fd = socket(AF_UNIX, SOCK_STREAM, 0)) > 0) {
+        DPRINTF("socket successful %s\n", __FILE__);
+    }else{
+        perror("socket error");
+        exit(-1);
+    }
+
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+//    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
+    snprintf(addr.sun_path, UNIX_PATH_MAX, "./socket123");
+
+    unlink(addr.sun_path);
+
+    DPRINTF("bind %s %s\n", addr.sun_path, __FILE__);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        perror("bind error");
+        exit(-1);
+    }else{
+        DPRINTF("bind %s successful %s\n", addr.sun_path, __FILE__);
+    }
+
+    DPRINTF("listen %s %s\n", addr.sun_path, __FILE__);
+    if (listen(fd, 5) != 0) {
+        perror("listen error");
+        exit(-1);
+    }else{
+        DPRINTF("listen %s successful %s\n", addr.sun_path, __FILE__);
+    }
+    
+    socklen_t csize;
+while((c = accept(fd, (struct sockaddr *) &addr, &csize)) > -1)
+{
+
+    DPRINTF("accept %s successful %s\n", addr.sun_path, __FILE__);
+    /* still inside server process */
+    close(c);
+}
+    close(fd);
+    unlink("./socket123");
+    exit(0);
+
+    DPRINTF("accept %s %s\n", addr.sun_path, __FILE__);
+    while(1){
+        c = accept(fd, (struct sockaddr *)&addr, &csize);
+        if(c<0){
+            perror("accept error");
+            exit(-1);
+        }else{
+            DPRINTF("accept %s successful %s\n", addr.sun_path, __FILE__);
+sleep(100);
+pthread_exit(NULL);
+        }
+     }
+
+    /*
+     * wait for further commands
+     */
+    DPRINTF("accepted migration %d\n", c);
+
+    if (c == -1) {
+        DPRINTF("could not accept migration connection %s\n", __FILE__);
+        goto err;
+    }
+
+    f = qemu_fopen_socket(c, "rb");
+    if (f == NULL) {
+        DPRINTF("could not qemu_fopen socket %s\n", __FILE__);
+        goto err2;
+    }
+
+/*
+    Error *local_err = NULL;
+    s = unix_listen(((struct dest_slave_para *)data)->path, NULL, 0, &local_err);
+    if (s < 0) {
+    DPRINTF("couldn't establish the connection %s\n", __FILE__);
+        pthread_exit(NULL);
+    }
+
+    struct sockaddr_un addr;
+    socklen_t addrlen = sizeof(addr);
+    QEMUFile *f;
+    int c, err;
+
+    do {
+    DPRINTF("waiting for establishing the connection %s\n", __FILE__);
+        c = qemu_accept(s, (struct sockaddr *)&addr, &addrlen);
+        err = errno;
+    } while (c < 0 && err == EINTR);
+    qemu_set_fd_handler(s, NULL, NULL, NULL);
+    close(s);
+
+    DPRINTF("accepted migration %s\n", __FILE__);
+
+    if (c < 0) {
+        fprintf(stderr, "could not accept migration connection (%s)",
+                     strerror(err));
+        pthread_exit(NULL);
+    }
+
+    f = qemu_fopen_socket(c, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "could not qemu_fopen socket");
+        goto out;
+    }
+
+*/
+    /*
+     * slave handle incoming data
+     */
+    slave_process_incoming_migration(f, para->handlers);
+
+    pthread_barrier_wait(para->end_barrier);
+    DPRINTF("Dest slave end\n");
+    //slave_loadvm_state();
+
+err2:
+    close(c);
+err:
+    close(fd);
+    free(para);
+    pthread_exit(NULL);
+}
+
+pthread_t create_dest_slave(const char *path, void *loadvm_handlers, pthread_barrier_t *end_barrier);
+
+pthread_t create_dest_slave(const char *path, void *loadvm_handlers, pthread_barrier_t *end_barrier) {
+    struct dest_slave_para *data = (struct dest_slave_para *)malloc(sizeof(struct dest_slave_para));
+    pthread_t tid;
+
+    data->path = path;
+    data->handlers = loadvm_handlers;
+    data->end_barrier = end_barrier;
+    pthread_create(&tid, NULL, start_dest_slave, data);
+sleep(200);
+exit(-1); //exit mark
+
+    return tid;
+}
+
+static int queue_pop_task(struct migration_task_queue *task_queue, void **arg) {
+    pthread_mutex_lock(&(task_queue->task_lock));
+    if (task_queue->list_head.next == &task_queue->list_head) {
+        pthread_mutex_unlock(&(task_queue->task_lock));
+        return -1;
+    } else {
+        struct migration_task *task;
+        task = (struct migration_task *)task_queue->list_head.next;
+        __list_del(task->list.prev, task->list.next);
+
+        task_queue->task_pending --;
+        *arg = task->body;
+        free(task);
+    }
+    pthread_mutex_unlock(&(task_queue->task_lock));
+
+    return 1;
+}
+
+static int vmstate_load(QEMUFile *f, SaveStateEntry *se, int version_id)
+{
+    if (!se->vmsd) {         /* Old style */
+        //classicsong change it
+        if (se->ops->load_state == ram_load) {
+            return se->ops->load_state(f, se, version_id);
+        }
+
+        return se->ops->load_state(f, se->opaque, version_id);
+    }
+    return vmstate_load_state(f, se->vmsd, se->opaque, version_id);
+}
+
+void
+slave_process_incoming_migration(QEMUFile *f, void *loadvm_handlers) {
+    LoadStateEntry *le;
+    uint8_t section_type;
+    uint32_t section_id;
+    int ret;
+
+    while ((section_type = qemu_get_byte(f)) != QEMU_VM_EOF) {
+        /*
+         * start modifying here tomorrow
+         */
+        //DPRINTF("get incomming commands %d\n", section_type);
+        switch (section_type) {
+        case QEMU_VM_SECTION_PART:
+        case QEMU_VM_SECTION_END:
+            section_id = qemu_get_be32(f);
+
+            QLIST_FOREACH(le, (migr_handler *)loadvm_handlers, entry) {
+                if (le->section_id == section_id) {
+                    break;
+                }
+            }
+
+            if (le == NULL) {
+                fprintf(stderr, "Unknown savevm section %d\n", section_id);
+                ret = -EINVAL;
+                goto out;
+            }
+
+            /*
+             * ram use ram_load
+             * disk use block_load
+             */
+            ret = vmstate_load(f, le->se, le->version_id);
+            if (ret < 0) {
+                fprintf(stderr, "qemu: warning: error while loading state section id %d\n",
+                        section_id);
+                goto out;
+            }
+            break;
+        case QEMU_VM_ITER_END:
+            fprintf(stderr, "receive end\n");
+            break;
+        }
+    }
+
+ out:
+    return;
+}
+

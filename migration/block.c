@@ -38,16 +38,6 @@
 
 #define MAX_INFLIGHT_IO 512
 
-//#define DEBUG_BLK_MIGRATION
-
-#ifdef DEBUG_BLK_MIGRATION
-#define DPRINTF(fmt, ...) \
-    do { printf("blk_migration: " fmt, ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTF(fmt, ...) \
-    do { } while (0)
-#endif
-
 typedef struct BlkMigDevState {
     /* Written during setup phase.  Can be read without a lock.  */
     BlockDriverState *bs;

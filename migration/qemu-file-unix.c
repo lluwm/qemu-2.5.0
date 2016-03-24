@@ -260,7 +260,7 @@ static const QEMUFileOps unix_read_ops = {
     .close =      unix_close
 };
 
-static const QEMUFileOps unix_write_ops = {
+const QEMUFileOps unix_write_ops = {
     .get_fd =     socket_get_fd,
     .writev_buffer = unix_writev_buffer,
     .close =      unix_close

@@ -333,8 +333,8 @@ static void process_incoming_migration_co(void *opaque)
     postcopy_state_set(POSTCOPY_INCOMING_NONE);
     migrate_generate_event(MIGRATION_STATUS_ACTIVE);
 
+    DPRINTF("ready to load vm state, %s\n", __FILE__);
     ret = qemu_loadvm_state(f);
-
     ps = postcopy_state_get();
     trace_process_incoming_migration_co_end(ret, ps);
     if (ps != POSTCOPY_INCOMING_NONE) {
@@ -363,6 +363,7 @@ static void process_incoming_migration_co(void *opaque)
     if (ret < 0) {
         migrate_generate_event(MIGRATION_STATUS_FAILED);
         error_report("load of migration failed: %s", strerror(-ret));
+exit(-1); // exit mark
         migrate_decompress_threads_join();
         exit(EXIT_FAILURE);
     }
@@ -407,12 +408,14 @@ static void process_incoming_migration_co(void *opaque)
 
 void process_incoming_migration(QEMUFile *f)
 {
+    DPRINTF("ready to coroutine create, %s\n", __FILE__);
     Coroutine *co = qemu_coroutine_create(process_incoming_migration_co);
     int fd = qemu_get_fd(f);
 
     assert(fd != -1);
     migrate_decompress_threads_create();
     qemu_set_nonblock(fd);
+    DPRINTF("ready to enter coroutine, %s\n", __FILE__);
     qemu_coroutine_enter(co, f);
 }
 
@@ -536,14 +539,6 @@ static bool migration_is_setup_or_active(int state)
 static void get_xbzrle_cache_stats(MigrationInfo *info)
 {
     if (migrate_use_xbzrle()) {
-        info->has_xbzrle_cache = true;
-        info->xbzrle_cache = g_malloc0(sizeof(*info->xbzrle_cache));
-        info->xbzrle_cache->cache_size = migrate_xbzrle_cache_size();
-        info->xbzrle_cache->bytes = xbzrle_mig_bytes_transferred();
-        info->xbzrle_cache->pages = xbzrle_mig_pages_transferred();
-        info->xbzrle_cache->cache_miss = xbzrle_mig_pages_cache_miss();
-        info->xbzrle_cache->cache_miss_rate = xbzrle_mig_cache_miss_rate();
-        info->xbzrle_cache->overflow = xbzrle_mig_pages_overflow();
     }
 }
 
@@ -683,17 +678,6 @@ void qmp_migrate_set_capabilities(MigrationCapabilityStatusList *params,
     }
 
     if (migrate_postcopy_ram()) {
-        if (migrate_use_compression()) {
-            /* The decompression threads asynchronously write into RAM
-             * rather than use the atomic copies needed to avoid
-             * userfaulting.  It should be possible to fix the decompression
-             * threads for compatibility in future.
-             */
-            error_report("Postcopy is not currently compatible with "
-                         "compression");
-            s->enabled_capabilities[MIGRATION_CAPABILITY_X_POSTCOPY_RAM] =
-                false;
-        }
     }
 }
 
@@ -1044,31 +1028,6 @@ void qmp_migrate_cancel(Error **errp)
 
 void qmp_migrate_set_cache_size(int64_t value, Error **errp)
 {
-    MigrationState *s = migrate_get_current();
-    int64_t new_size;
-
-    /* Check for truncation */
-    if (value != (size_t)value) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
-                   "exceeding address space");
-        return;
-    }
-
-    /* Cache should not be larger than guest ram size */
-    if (value > ram_bytes_total()) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
-                   "exceeds guest ram size ");
-        return;
-    }
-
-    new_size = xbzrle_cache_resize(value);
-    if (new_size < 0) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "cache size",
-                   "is smaller than page size");
-        return;
-    }
-
-    s->xbzrle_cache_size = new_size;
 }
 
 int64_t qmp_query_migrate_cache_size(Error **errp)
@@ -1396,121 +1355,6 @@ static int await_return_path_close_on_source(MigrationState *ms)
     return ms->rp_state.error;
 }
 
-/*
- * Switch from normal iteration to postcopy
- * Returns non-0 on error
- */
-static int postcopy_start(MigrationState *ms, bool *old_vm_running)
-{
-    int ret;
-    const QEMUSizedBuffer *qsb;
-    int64_t time_at_stop = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-    migrate_set_state(ms, MIGRATION_STATUS_ACTIVE,
-                      MIGRATION_STATUS_POSTCOPY_ACTIVE);
-
-    trace_postcopy_start();
-    qemu_mutex_lock_iothread();
-    trace_postcopy_start_set_run();
-
-    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
-    *old_vm_running = runstate_is_running();
-    global_state_store();
-    ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
-
-    if (ret < 0) {
-        goto fail;
-    }
-
-    /*
-     * Cause any non-postcopiable, but iterative devices to
-     * send out their final data.
-     */
-    qemu_savevm_state_complete_precopy(ms->file, true);
-
-    /*
-     * in Finish migrate and with the io-lock held everything should
-     * be quiet, but we've potentially still got dirty pages and we
-     * need to tell the destination to throw any pages it's already received
-     * that are dirty
-     */
-    if (ram_postcopy_send_discard_bitmap(ms)) {
-        error_report("postcopy send discard bitmap failed");
-        goto fail;
-    }
-
-    /*
-     * send rest of state - note things that are doing postcopy
-     * will notice we're in POSTCOPY_ACTIVE and not actually
-     * wrap their state up here
-     */
-    qemu_file_set_rate_limit(ms->file, INT64_MAX);
-    /* Ping just for debugging, helps line traces up */
-    qemu_savevm_send_ping(ms->file, 2);
-
-    /*
-     * While loading the device state we may trigger page transfer
-     * requests and the fd must be free to process those, and thus
-     * the destination must read the whole device state off the fd before
-     * it starts processing it.  Unfortunately the ad-hoc migration format
-     * doesn't allow the destination to know the size to read without fully
-     * parsing it through each devices load-state code (especially the open
-     * coded devices that use get/put).
-     * So we wrap the device state up in a package with a length at the start;
-     * to do this we use a qemu_buf to hold the whole of the device state.
-     */
-    QEMUFile *fb = qemu_bufopen("w", NULL);
-    if (!fb) {
-        error_report("Failed to create buffered file");
-        goto fail;
-    }
-
-    /*
-     * Make sure the receiver can get incoming pages before we send the rest
-     * of the state
-     */
-    qemu_savevm_send_postcopy_listen(fb);
-
-    qemu_savevm_state_complete_precopy(fb, false);
-    qemu_savevm_send_ping(fb, 3);
-
-    qemu_savevm_send_postcopy_run(fb);
-
-    /* <><> end of stuff going into the package */
-    qsb = qemu_buf_get(fb);
-
-    /* Now send that blob */
-    if (qemu_savevm_send_packaged(ms->file, qsb)) {
-        goto fail_closefb;
-    }
-    qemu_fclose(fb);
-    ms->downtime =  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - time_at_stop;
-
-    qemu_mutex_unlock_iothread();
-
-    /*
-     * Although this ping is just for debug, it could potentially be
-     * used for getting a better measurement of downtime at the source.
-     */
-    qemu_savevm_send_ping(ms->file, 4);
-
-    ret = qemu_file_get_error(ms->file);
-    if (ret) {
-        error_report("postcopy_start: Migration stream errored");
-        migrate_set_state(ms, MIGRATION_STATUS_POSTCOPY_ACTIVE,
-                              MIGRATION_STATUS_FAILED);
-    }
-
-    return ret;
-
-fail_closefb:
-    qemu_fclose(fb);
-fail:
-    migrate_set_state(ms, MIGRATION_STATUS_POSTCOPY_ACTIVE,
-                          MIGRATION_STATUS_FAILED);
-    qemu_mutex_unlock_iothread();
-    return -1;
-}
-
 /**
  * migration_completion: Used by migration_thread when there's not much left.
  *   The caller 'breaks' the loop when this returns.
@@ -1604,22 +1448,7 @@ static void *migration_thread(void *opaque)
 
     qemu_savevm_state_header(s->file);
 
-    if (migrate_postcopy_ram()) {
-        /* Now tell the dest that it should open its end so it can reply */
-        qemu_savevm_send_open_return_path(s->file);
-
-        /* And do a ping that will make stuff easier to debug */
-        qemu_savevm_send_ping(s->file, 1);
-
-        /*
-         * Tell the destination that we *might* want to do postcopy later;
-         * if the other end can't do postcopy it should fail now, nice and
-         * early.
-         */
-        qemu_savevm_send_postcopy_advise(s->file);
-    }
-
-    qemu_savevm_state_begin(s->file, &s->params);
+    qemu_savevm_state_begin(s->file);
 
     s->setup_time = qemu_clock_get_ms(QEMU_CLOCK_HOST) - setup_start;
     current_active_state = MIGRATION_STATUS_ACTIVE;
@@ -1643,18 +1472,6 @@ static void *migration_thread(void *opaque)
             if (pending_size && pending_size >= max_size) {
                 /* Still a significant amount to transfer */
 
-                if (migrate_postcopy_ram() &&
-                    s->state != MIGRATION_STATUS_POSTCOPY_ACTIVE &&
-                    pend_nonpost <= max_size &&
-                    atomic_read(&s->start_postcopy)) {
-
-                    if (!postcopy_start(s, &old_vm_running)) {
-                        current_active_state = MIGRATION_STATUS_POSTCOPY_ACTIVE;
-                        entered_postcopy = true;
-                    }
-
-                    continue;
-                }
                 /* Just another iteration step */
                 qemu_savevm_state_iterate(s->file, entered_postcopy);
             } else {

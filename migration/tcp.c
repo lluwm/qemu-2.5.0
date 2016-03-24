@@ -23,16 +23,6 @@
 #include "block/block.h"
 #include "qemu/main-loop.h"
 
-//#define DEBUG_MIGRATION_TCP
-
-#ifdef DEBUG_MIGRATION_TCP
-#define DPRINTF(fmt, ...) \
-    do { printf("migration-tcp: " fmt, ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTF(fmt, ...) \
-    do { } while (0)
-#endif
-
 static void tcp_wait_for_connect(int fd, Error *err, void *opaque)
 {
     MigrationState *s = opaque;

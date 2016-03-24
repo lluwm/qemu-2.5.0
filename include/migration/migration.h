@@ -20,6 +20,7 @@
 #include "qemu/notify.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
+#include "migration/migr-task.h"
 #include "qapi-types.h"
 #include "exec/cpu-common.h"
 
@@ -36,7 +37,59 @@
 #define QEMU_VM_VMDESCRIPTION        0x06
 #define QEMU_VM_CONFIGURATION        0x07
 #define QEMU_VM_COMMAND              0x08
+#define QEMU_VM_SECTION_NEGOTIATE    0x09
 #define QEMU_VM_SECTION_FOOTER       0x7e
+
+#define NUM_SLAVES 1
+#define MAX_ITER 30
+#define MAX_FACTOR 4
+#define MAX_DOWNTIME 200000000
+
+#define MEMORY_MASTER 1
+
+#define DEBUG_MIGRATION_SAVEVM
+#ifdef DEBUG_MIGRATION_SAVEVM
+#define DPRINTF(fmt, ...) \
+    do { printf(fmt, ## __VA_ARGS__); } while (0)
+#else
+#define DPRINTF(fmt, ...) \
+    do { } while (0)
+#endif
+
+extern const char *socket_paths[4];
+
+struct migration_master
+{
+    struct migration_master *next;
+    int type;
+    pthread_t tid;
+};
+
+typedef struct CompatEntry {
+    char idstr[256];
+    int instance_id;
+} CompatEntry;
+
+typedef struct SaveStateEntry {
+    QTAILQ_ENTRY(SaveStateEntry) entry;
+    char idstr[256];
+    int instance_id;
+    int alias_id;
+    int version_id;
+    int section_id;
+    SaveVMHandlers *ops;
+    const VMStateDescription *vmsd;
+    void *opaque;
+    CompatEntry *compat;
+    int is_ram;
+} SaveStateEntry;
+
+struct LoadStateEntry {
+    QLIST_ENTRY(LoadStateEntry) entry;
+    SaveStateEntry *se;
+    int section_id;
+    int version_id;
+};
 
 struct MigrationParams {
     bool blk;
@@ -112,6 +165,8 @@ struct MigrationIncomingState {
 MigrationIncomingState *migration_incoming_get_current(void);
 MigrationIncomingState *migration_incoming_state_new(QEMUFile *f);
 void migration_incoming_state_destroy(void);
+unsigned long ram_save_block_master(struct migration_task_queue *task_queue);
+int ram_load(QEMUFile *f, void *opaque, int version_id);
 
 /*
  * An outstanding page request, on the source, having been received
@@ -156,6 +211,15 @@ struct MigrationState
     int64_t setup_time;
     int64_t dirty_sync_count;
 
+    struct migration_task_queue *mem_task_queue;
+    struct migration_task_queue *disk_task_queue;
+    struct migration_slave *slave_list;
+    struct migration_master *master_list;
+    struct migration_barrier *sender_barr;
+    pthread_barrier_t last_barr;
+    volatile int laster_iter;
+    int section_id;
+
     /* Flag set once the migration has been asked to enter postcopy */
     bool start_postcopy;
 
@@ -167,6 +231,27 @@ struct MigrationState
     QSIMPLEQ_HEAD(src_page_requests, MigrationSrcPageRequest) src_page_requests;
     /* The RAMBlock used in the last src_page_request */
     RAMBlock *last_req_rb;
+};
+
+typedef struct MigrationStateSlave MigrationStateSlave;
+struct MigrationStateSlave
+{
+    MigrationState mig_state;
+    struct MigrationStateSlave *next;
+    int64_t bandwidth_limit;
+    QEMUFile *file;
+    int fd;
+    Monitor *mon;
+    int state;
+    int (*get_error)(struct MigrationStateSlave*);
+    int (*close)(struct MigrationStateSlave*);
+    int (*write)(struct MigrationStateSlave*, const void *, size_t);
+    void *opaque;
+    const char *path;
+    struct migration_task_queue *mem_task_queue;
+    struct migration_task_queue *disk_task_queue;
+    struct migration_barrier *sender_barr;
+    int id;
 };
 
 void process_incoming_migration(QEMUFile *f);

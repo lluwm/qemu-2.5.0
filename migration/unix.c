@@ -23,16 +23,6 @@
 #include "migration/qemu-file.h"
 #include "block/block.h"
 
-//#define DEBUG_MIGRATION_UNIX
-
-#ifdef DEBUG_MIGRATION_UNIX
-#define DPRINTF(fmt, ...) \
-    do { printf("migration-unix: " fmt, ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTF(fmt, ...) \
-    do { } while (0)
-#endif
-
 static void unix_wait_for_connect(int fd, Error *err, void *opaque)
 {
     MigrationState *s = opaque;

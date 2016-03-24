@@ -21,16 +21,6 @@
 #include "migration/qemu-file.h"
 #include "block/block.h"
 
-//#define DEBUG_MIGRATION_FD
-
-#ifdef DEBUG_MIGRATION_FD
-#define DPRINTF(fmt, ...) \
-    do { printf("migration-fd: " fmt, ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTF(fmt, ...) \
-    do { } while (0)
-#endif
-
 static bool fd_is_socket(int fd)
 {
     struct stat stat;
