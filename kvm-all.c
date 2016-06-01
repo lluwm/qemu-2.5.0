@@ -1470,7 +1470,7 @@ static int kvm_init(MachineState *ms)
 #endif
     s->vmfd = -1;
     if (kvm2_enable) {
-        s->fd = qemu_open("/dev/kvm2", O_RDWR);
+        s->fd = qemu_open("/dev/KVM", O_RDWR);
     } else {
         s->fd = qemu_open("/dev/kvm", O_RDWR);
     }
